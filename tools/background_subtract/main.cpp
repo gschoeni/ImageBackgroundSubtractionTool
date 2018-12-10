@@ -9,6 +9,7 @@
 #include <unistd.h>
 //C++
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <vector>
 #include <thread>
@@ -39,17 +40,19 @@ struct MousePoint
 string ORIGINAL_WINDOW_NAME = "Original";
 string SUBTRACTED_WINDOW_NAME = "Subtracted";
 string MASK_WINDOW_NAME = "Mask";
-size_t IMAGE_WIDTH = 400;
-size_t IMAGE_HEIGHT = 600;
+string OUTPUT_DIR = "originals/";
+string MASK_FILE_PREFIX = "mask_original_";
+size_t IMAGE_WIDTH = 342;
+size_t IMAGE_HEIGHT = 512;
 
 MousePoint g_mousePosition(0,0);
 bool g_isInErasingMode = false;
 bool g_isInRestoringMode = false;
 bool g_mouseIsDown = false;
-cv::Mat g_originalImage;
-cv::Mat g_newSubtractedImage;
-cv::Mat g_originalSubtractedImage;
-cv::Mat g_currentImageMask;
+vector<cv::Mat> g_originalImages;
+vector<cv::Mat> g_backgroundSubtractedImages;
+vector<cv::Mat> g_imageMasks;
+int g_currentFrame = 0;
 int g_circleRadius = 10;
 
 bool g_killThread = false;
@@ -100,11 +103,12 @@ int main(int argc, char* argv[])
     return EXIT_SUCCESS;
 }
 
-void threadFn(
-    char* a_videoFilename,
-    vector<cv::Mat>& a_frames,
-    vector<cv::Mat>& a_imageMasks,
-    vector<cv::Mat>& a_backgroundSubtractedImages)
+inline bool fileExists (const std::string& name) {
+    ifstream f(name.c_str());
+    return f.good();
+}
+
+void threadFn(char* a_videoFilename)
 {
     std::cout << "thread function" << endl;
     Ptr<BackgroundSubtractor> pMOG2; //MOG2 Background subtractor
@@ -138,19 +142,33 @@ void threadFn(
         cv::resize(frame, frame, cv::Size(IMAGE_HEIGHT, IMAGE_WIDTH));
         cv::rotate(frame, frame, cv::ROTATE_90_CLOCKWISE);
 
-        //update the background model
+        // update the background model
         pMOG2->apply(frame, fgMask);
-
-        // apply mask to subtract background
-        cv::Mat bgSubtracted;
-        frame.copyTo(bgSubtracted, fgMask);
-
 
         if (!l_isFirstImage)
         {
-            a_frames.push_back(frame);
-            a_imageMasks.push_back(fgMask);
-            a_backgroundSubtractedImages.push_back(bgSubtracted);
+            g_originalImages.push_back(frame);
+            g_imageMasks.push_back(fgMask);
+
+            cv::Mat bgSubtracted;
+
+            size_t l_frameNum = g_imageMasks.size()-1;
+            stringstream l_ss;
+            l_ss << OUTPUT_DIR << MASK_FILE_PREFIX << l_frameNum << ".png";
+            string l_maskFileName = l_ss.str();
+            if (fileExists(l_maskFileName))
+            {
+                cv::Mat l_mask = cv::imread(l_maskFileName);
+                g_imageMasks.at(l_frameNum) = l_mask;
+                frame.copyTo(bgSubtracted, l_mask);
+            }
+            else
+            {
+                // apply mask to subtract background
+                frame.copyTo(bgSubtracted, fgMask);
+            }
+
+            g_backgroundSubtractedImages.push_back(bgSubtracted);
         }
         l_isFirstImage = false;
         
@@ -168,44 +186,44 @@ void threadFn(
     capture.release();
 }
 
-bool processKeyForFrameNum(int& a_frameNum, int a_key, int a_maxFrameNum)
+bool processKeyForFrameNum(int a_key, int a_maxFrameNum)
 {
-    int l_frameNum = a_frameNum;
+    int l_frameNum = g_currentFrame;
 
     if (3 == a_key) // left arrow
     {
-        a_frameNum++;
+        g_currentFrame++;
     }
     else if (2 == a_key) // right arrow
     {
-        a_frameNum--;
+        g_currentFrame--;
     }
     else if (100 == a_key) // d, +10 frames
     {
-        a_frameNum += 10;
+        g_currentFrame += 10;
     }
     else if (97 == a_key) // a, -10 frames
     {
-        a_frameNum -= 10;
+        g_currentFrame -= 10;
     }
 
     // Make sure we don't overflow
     if (l_frameNum < 0)
     {
-        a_frameNum = 0;
+        g_currentFrame = 0;
     }
 
     if (l_frameNum >= a_maxFrameNum)
     {
-        a_frameNum = a_maxFrameNum - 1;
+        g_currentFrame = a_maxFrameNum - 1;
     }
 
-    return l_frameNum != a_frameNum;
+    return l_frameNum != g_currentFrame;
 }
 
 void DrawImgWithCircleUnderMouse()
 {
-    cv::Mat l_imageWithCircle = g_newSubtractedImage.clone();
+    cv::Mat l_imageWithCircle = g_backgroundSubtractedImages.at(g_currentFrame).clone();
     if (g_isInRestoringMode)
     {
         cv::circle(l_imageWithCircle, cv::Point(g_mousePosition.x, g_mousePosition.y), g_circleRadius, cv::Scalar(0,255,0), -1);
@@ -216,7 +234,7 @@ void DrawImgWithCircleUnderMouse()
     }
 
     imshow(SUBTRACTED_WINDOW_NAME, l_imageWithCircle);
-    imshow(MASK_WINDOW_NAME, g_currentImageMask);
+    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
 }
 
 void UpdateCircleRadius(int a_key)
@@ -263,22 +281,22 @@ void UpdateDrawingMode(int a_key)
 
 void EraseAreaUnderMouse()
 {
-    cout << "ERASE AREA UNDER MOUSE!" << endl;
+    // cout << "ERASE AREA UNDER MOUSE!" << endl;
 
     if (g_isInRestoringMode)
     {
-        cv::circle(g_currentImageMask, cv::Point(g_mousePosition.x, g_mousePosition.y), g_circleRadius, cv::Scalar(255,255,255), -1);
+        cv::circle(g_imageMasks.at(g_currentFrame) , cv::Point(g_mousePosition.x, g_mousePosition.y), g_circleRadius, cv::Scalar(255,255,255), -1);
     }
     else
     {
-        cv::circle(g_currentImageMask, cv::Point(g_mousePosition.x, g_mousePosition.y), g_circleRadius, cv::Scalar(0,0,0), -1);
+        cv::circle(g_imageMasks.at(g_currentFrame) , cv::Point(g_mousePosition.x, g_mousePosition.y), g_circleRadius, cv::Scalar(0,0,0), -1);
     }
 
     cv::Mat l_newBgSubtract;
-    g_originalImage.copyTo(l_newBgSubtract, g_currentImageMask);
-    g_newSubtractedImage = l_newBgSubtract.clone();
-    imshow(SUBTRACTED_WINDOW_NAME, g_newSubtractedImage);
-    imshow(MASK_WINDOW_NAME, g_currentImageMask);
+    g_originalImages.at(g_currentFrame).copyTo(l_newBgSubtract, g_imageMasks.at(g_currentFrame) );
+    g_backgroundSubtractedImages.at(g_currentFrame) = l_newBgSubtract.clone();
+    imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
+    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame) );
 }
 
 void MouseCallBackFunc(int event, int x, int y, int flags, void* userdata)
@@ -314,28 +332,45 @@ void MouseCallBackFunc(int event, int x, int y, int flags, void* userdata)
         }
         else
         {
-            imshow(SUBTRACTED_WINDOW_NAME, g_originalSubtractedImage);
-            imshow(MASK_WINDOW_NAME, g_currentImageMask);
+            imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
+            imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
+        }
+    }
+}
+
+void MaybeSave(int a_key)
+{
+    if (a_key == 115) // 's'
+    {
+        cout << "Writing image " << g_currentFrame << " to " << g_currentFrame << endl;
+        {
+            stringstream l_ss;
+            l_ss << OUTPUT_DIR << "original_" << g_currentFrame << ".png";
+            cv::imwrite(l_ss.str(), g_originalImages.at(g_currentFrame));
+        }
+        
+        {
+            stringstream l_ss;
+            l_ss << OUTPUT_DIR << "nobg_" << g_currentFrame << ".png";
+            cv::imwrite(l_ss.str(), g_backgroundSubtractedImages.at(g_currentFrame));
+        }
+
+        {
+            stringstream l_ss;
+            l_ss << OUTPUT_DIR << MASK_FILE_PREFIX << g_currentFrame << ".png";
+            cv::imwrite(l_ss.str(), g_imageMasks.at(g_currentFrame) );
         }
     }
 }
 
 void processVideo(char* videoFilename)
 {
-    vector<cv::Mat> frames;
-    vector<cv::Mat> imageMasks;
-    vector<cv::Mat> backgroundSubtractedImages;
-
-    std::thread t(threadFn,
-        std::ref(videoFilename),
-        std::ref(frames),
-        std::ref(imageMasks),
-        std::ref(backgroundSubtractedImages));
+    std::thread t(threadFn, std::ref(videoFilename));
     std::cout << "main thread\n";
 
     size_t l_numFrames = 100;
 
-    while (frames.size() < l_numFrames) {
+    while (g_originalImages.size() < l_numFrames) {
         // cout << "waiting for 100 frames" << endl;
         usleep(100000);
     }
@@ -348,46 +383,37 @@ void processVideo(char* videoFilename)
 
     setMouseCallback(SUBTRACTED_WINDOW_NAME, MouseCallBackFunc, NULL);
 
-    int l_frameNum = 0;
-    g_originalImage = frames.at(l_frameNum).clone();
-    g_currentImageMask = imageMasks.at(l_frameNum).clone();
-    g_originalSubtractedImage = backgroundSubtractedImages.at(l_frameNum).clone();
-    g_newSubtractedImage = backgroundSubtractedImages.at(l_frameNum).clone();
-
     // show the current frame and the fg masks
-    imshow(ORIGINAL_WINDOW_NAME, g_originalImage);
-    imshow(SUBTRACTED_WINDOW_NAME, g_newSubtractedImage);
-    imshow(MASK_WINDOW_NAME, g_currentImageMask);
+    imshow(ORIGINAL_WINDOW_NAME, g_originalImages.at(g_currentFrame));
+    imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
+    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
 
-    while (l_frameNum < frames.size())
+    while (g_currentFrame < g_originalImages.size())
     {
         int l_key = waitKey();
         cout << l_key << endl;
-        if (processKeyForFrameNum(l_frameNum, l_key, frames.size()))
+        if (processKeyForFrameNum(l_key, g_originalImages.size()))
         {
-            cout << "Getting image at: " << l_frameNum << endl;
-            g_originalImage = frames.at(l_frameNum).clone();
-            g_currentImageMask = imageMasks.at(l_frameNum).clone();
-            g_originalSubtractedImage = backgroundSubtractedImages.at(l_frameNum).clone();
-            g_newSubtractedImage = backgroundSubtractedImages.at(l_frameNum).clone();
+            cout << "Getting image at: " << g_currentFrame << endl;
 
             // get the frame number and write it on the current frame
             // stringstream ss;
             // rectangle(frame, cv::Point(10, 2), cv::Point(100,20),
             //           cv::Scalar(255,255,255), -1);
-            // ss << l_frameNum;
+            // ss << g_currentFrame;
             // string frameNumberString = ss.str();
             // putText(frame, frameNumberString.c_str(), cv::Point(15, 15),
             //         FONT_HERSHEY_SIMPLEX, 0.5 , cv::Scalar(0,0,0));
 
             //show the current frame and the fg masks
-            imshow(ORIGINAL_WINDOW_NAME, g_originalImage);
-            imshow(SUBTRACTED_WINDOW_NAME, g_newSubtractedImage);
-            imshow(MASK_WINDOW_NAME, g_currentImageMask);
+            imshow(ORIGINAL_WINDOW_NAME, g_originalImages.at(g_currentFrame));
+            imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
+            imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
         }
 
         UpdateDrawingMode(l_key);
         UpdateCircleRadius(l_key);
+        MaybeSave(l_key);
 
         if (l_key == 113 || l_key == 27) // quit if 'q' or 'esc'
         {
