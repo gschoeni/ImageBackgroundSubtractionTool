@@ -4,6 +4,7 @@
 #include "opencv2/videoio.hpp"
 #include <opencv2/highgui.hpp>
 #include <opencv2/video.hpp>
+#include <opencv2/opencv.hpp>
 //C
 #include <stdio.h>
 #include <unistd.h>
@@ -54,6 +55,9 @@ vector<cv::Mat> g_backgroundSubtractedImages;
 vector<cv::Mat> g_imageMasks;
 int g_currentFrame = 0;
 int g_circleRadius = 10;
+cv::Rect g_grabCutRectangle;
+cv::Mat g_grabCutBGModel, g_grabCutFGModel; // the models (internally used)
+bool g_grabCutIsInitialized = false;
 
 bool g_killThread = false;
 
@@ -158,7 +162,7 @@ void threadFn(char* a_videoFilename)
             string l_maskFileName = l_ss.str();
             if (fileExists(l_maskFileName))
             {
-                cv::Mat l_mask = cv::imread(l_maskFileName);
+                cv::Mat l_mask = cv::imread(l_maskFileName, cv::IMREAD_GRAYSCALE);
                 g_imageMasks.at(l_frameNum) = l_mask;
                 frame.copyTo(bgSubtracted, l_mask);
             }
@@ -184,6 +188,293 @@ void threadFn(char* a_videoFilename)
     }
     //delete capture object
     capture.release();
+}
+
+static void getBinMask( const Mat& comMask, Mat& binMask )
+{
+    if( comMask.empty() || comMask.type()!=CV_8UC1 )
+        CV_Error( Error::StsBadArg, "comMask is empty or has incorrect type (not CV_8UC1)" );
+    if( binMask.empty() || binMask.rows!=comMask.rows || binMask.cols!=comMask.cols )
+        binMask.create( comMask.size(), CV_8UC1 );
+    binMask = comMask & 1;
+}
+
+bool hasNeighboringWhitePixel(const cv::Mat& a_mat, size_t i, size_t j)
+{
+    if (i < a_mat.rows - 1)
+    {
+        uchar l_rgb = a_mat.at<uchar>(i+1,j);
+        if (l_rgb == 255)
+        {
+            return true;
+        }
+    }
+
+    if (i > 0)
+    {
+        uchar l_rgb = a_mat.at<uchar>(i-1,j);
+        if (l_rgb == 255)
+        {
+            return true;
+        }
+    }
+
+    if (i < a_mat.cols - 1)
+    {
+        uchar l_rgb = a_mat.at<uchar>(i,j+1);
+        if (l_rgb == 255)
+        {
+            return true;
+        }
+    }
+
+    if (j > 0)
+    {
+        uchar l_rgb = a_mat.at<uchar>(i,j-1);
+        if (l_rgb == 255)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t FindMaskMinX()
+{
+    cv::Mat l_mask = g_imageMasks.at(g_currentFrame);
+    size_t l_min = l_mask.cols;
+    for (size_t i = 0; i < l_mask.rows; ++i)
+    {
+        for (size_t j = 0; j < l_mask.cols; ++j)
+        {
+            uchar l_rgb = l_mask.at<uchar>(i,j);
+            if (l_rgb == 255 && hasNeighboringWhitePixel(l_mask, i, j))
+            {
+                if (j < l_min)
+                {
+                    l_min = j;
+                }
+            }
+        }
+    }
+
+    return l_min;
+}
+
+size_t FindMaskMinY()
+{
+    cv::Mat l_mask = g_imageMasks.at(g_currentFrame);
+    size_t l_min = l_mask.rows;
+    for (size_t i = 0; i < l_mask.rows; ++i)
+    {
+        for (size_t j = 0; j < l_mask.cols; ++j)
+        {
+            uchar l_rgb = l_mask.at<uchar>(i,j);
+            if (l_rgb == 255 && hasNeighboringWhitePixel(l_mask, i, j))
+            {
+                if (i < l_min)
+                {
+                    l_min = i;
+                }
+            }
+        }
+    }
+
+    return l_min;
+}
+
+size_t FindMaskMaxX()
+{
+    size_t l_max = 0;
+    cv::Mat l_mask = g_imageMasks.at(g_currentFrame);
+    for (size_t i = 0; i < l_mask.rows; ++i)
+    {
+        for (size_t j = 0; j < l_mask.cols; ++j)
+        {
+            uchar l_rgb = l_mask.at<uchar>(i,j);
+            if (l_rgb == 255 && hasNeighboringWhitePixel(l_mask, i, j))
+            {
+                if (j > l_max)
+                {
+                    l_max = j;
+                }
+            }
+        }
+    }
+
+    return l_max;
+}
+
+size_t FindMaskMaxY()
+{
+    size_t l_max = 0;
+    cv::Mat l_mask = g_imageMasks.at(g_currentFrame);
+    for (size_t i = 0; i < l_mask.rows; ++i)
+    {
+        for (size_t j = 0; j < l_mask.cols; ++j)
+        {
+            uchar l_rgb = l_mask.at<uchar>(i,j);
+            if (l_rgb == 255 && hasNeighboringWhitePixel(l_mask, i, j))
+            {
+                if (i > l_max)
+                {
+                    l_max = i;
+                }
+            }
+        }
+    }
+
+    return l_max;
+}
+
+void ConvertBinaryTo255(cv::Mat& a_mat)
+{
+    for (size_t i = 0; i < a_mat.rows; ++i)
+    {
+        for (size_t j = 0; j < a_mat.cols; ++j)
+        {
+            if (1 == a_mat.at<uchar>(i,j))
+            {
+                a_mat.at<uchar>(i,j) = 255;
+            }
+        }
+    }
+}
+
+void DrawGrabcutRectangle()
+{
+    size_t l_minX = FindMaskMinX();
+    size_t l_minY = FindMaskMinY();
+    size_t l_maxX = FindMaskMaxX();
+    size_t l_maxY = FindMaskMaxY();
+
+    cout << "Got rect " << l_minX << ", " << l_minY << ", " << l_maxX << ", " << l_maxY << endl;
+
+    g_grabCutRectangle.x = l_minX;
+    g_grabCutRectangle.y = l_minY;
+    g_grabCutRectangle.width = l_maxX-l_minX;
+    g_grabCutRectangle.height = l_maxY-l_minY;
+
+    cv::rectangle(g_backgroundSubtractedImages.at(g_currentFrame), g_grabCutRectangle, cv::Scalar(0,255,0),1);
+}
+
+bool isOutsideRect(const cv::Rect& a_rect, size_t i, size_t j)
+{
+    if (j < (a_rect.x + (.5*a_rect.width)) && j > (a_rect.x - (.5*a_rect.width)) &&
+        i < (a_rect.y + (.5*a_rect.height)) && i > (a_rect.y - (.5*a_rect.height)))
+    {
+        return false; // is inside rect
+    }
+
+    return true; // is outside rct
+}
+
+void ShowImages()
+{
+    // DrawGrabcutRectangle();
+
+    // show the current frame and the fg masks
+    imshow(ORIGINAL_WINDOW_NAME, g_originalImages.at(g_currentFrame));
+    imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
+    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
+}
+
+void ShowImagesWithTmpBGImage(const cv::Mat& a_img)
+{
+    // DrawGrabcutRectangle();
+
+    // show the current frame and the fg masks
+    imshow(ORIGINAL_WINDOW_NAME, g_originalImages.at(g_currentFrame));
+    imshow(SUBTRACTED_WINDOW_NAME, a_img);
+    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
+}
+
+void ApplyGrabCut()
+{
+    cout << "ApplyGrabCut!" << endl;
+
+    size_t l_minX = FindMaskMinX();
+    size_t l_minY = FindMaskMinY();
+    size_t l_maxX = FindMaskMaxX();
+    size_t l_maxY = FindMaskMaxY();
+
+    g_grabCutRectangle.x = l_minX;
+    g_grabCutRectangle.y = l_minY;
+    g_grabCutRectangle.width = l_maxX-l_minX;
+    g_grabCutRectangle.height = l_maxY-l_minY;
+
+    cv::Mat l_mask = g_imageMasks.at(g_currentFrame).clone();
+    for (size_t i = 0; i < l_mask.rows; ++i)
+    {
+        for (size_t j = 0; j < l_mask.cols; ++j)
+        {
+            if (l_mask.at<uchar>(i,j) == 255)
+            {
+                l_mask.at<uchar>(i,j) = GC_PR_FGD;
+            }
+            else
+            {
+                l_mask.at<uchar>(i,j) = GC_PR_BGD;
+            }
+        }
+    }
+
+    // GrabCut segmentation
+    if (g_grabCutIsInitialized)
+    {
+        cv::grabCut(g_originalImages.at(g_currentFrame),    // input image
+                l_mask,   // segmentation result
+                g_grabCutRectangle,// rectangle containing foreground
+                g_grabCutBGModel, g_grabCutFGModel, // models
+                1);        // number of iterations
+    }
+    else
+    {
+        cv::grabCut(g_originalImages.at(g_currentFrame),    // input image
+                l_mask,   // segmentation result
+                g_grabCutRectangle,// rectangle containing foreground
+                g_grabCutBGModel, g_grabCutFGModel, // models
+                1,        // number of iterations
+                cv::GC_INIT_WITH_RECT | cv::GC_INIT_WITH_MASK); // use rectangle
+    }
+    
+
+    // for (size_t i = 0; i < l_mask.rows; ++i)
+    // {
+    //     for (size_t j = 0; j < l_mask.cols; ++j)
+    //     {
+    //         if (l_mask.at<uchar>(i,j) == GC_FGD)
+    //         {
+    //             g_imageMasks.at(g_currentFrame).at<uchar>(i,j) = 255;
+    //         }
+    //         else
+    //         {
+    //             g_imageMasks.at(g_currentFrame).at<uchar>(i,j) = 0;
+    //         }
+    //     }
+    // }
+
+    cv::Mat l_binMask;
+    getBinMask(l_mask, l_binMask);
+
+    cv::Mat l_combined;
+    cv::bitwise_and(l_binMask, g_imageMasks.at(g_currentFrame), l_combined);
+
+    cv::Mat l_combinedSubtracted;
+    g_originalImages.at(g_currentFrame).copyTo(l_combinedSubtracted, l_combined);
+    g_backgroundSubtractedImages.at(g_currentFrame) = l_combinedSubtracted.clone();
+
+    ConvertBinaryTo255(l_combined);
+    g_imageMasks.at(g_currentFrame) = l_combined.clone();
+
+    // cv::Mat l_grabCutSubtracted;
+    // g_originalImages.at(g_currentFrame).copyTo(l_grabCutSubtracted, binMask);
+
+    // cv::Mat l_nnSubtracted;
+    // l_grabCutSubtracted.copyTo(l_nnSubtracted, g_imageMasks.at(g_currentFrame));
+
+    // g_backgroundSubtractedImages.at(g_currentFrame) = l_nnSubtracted.clone();
+    ShowImages();
 }
 
 bool processKeyForFrameNum(int a_key, int a_maxFrameNum)
@@ -233,8 +524,7 @@ void DrawImgWithCircleUnderMouse()
         cv::circle(l_imageWithCircle, cv::Point(g_mousePosition.x, g_mousePosition.y), g_circleRadius, cv::Scalar(0,0,255), -1);
     }
 
-    imshow(SUBTRACTED_WINDOW_NAME, l_imageWithCircle);
-    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
+    ShowImagesWithTmpBGImage(l_imageWithCircle);
 }
 
 void UpdateCircleRadius(int a_key)
@@ -293,10 +583,10 @@ void EraseAreaUnderMouse()
     }
 
     cv::Mat l_newBgSubtract;
-    g_originalImages.at(g_currentFrame).copyTo(l_newBgSubtract, g_imageMasks.at(g_currentFrame) );
+    g_originalImages.at(g_currentFrame).copyTo(l_newBgSubtract, g_imageMasks.at(g_currentFrame));
     g_backgroundSubtractedImages.at(g_currentFrame) = l_newBgSubtract.clone();
-    imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
-    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame) );
+
+    ShowImages();
 }
 
 void MouseCallBackFunc(int event, int x, int y, int flags, void* userdata)
@@ -332,8 +622,7 @@ void MouseCallBackFunc(int event, int x, int y, int flags, void* userdata)
         }
         else
         {
-            imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
-            imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
+            ShowImages();
         }
     }
 }
@@ -363,12 +652,20 @@ void MaybeSave(int a_key)
     }
 }
 
+void CheckForApplyGrabCut(int a_key)
+{
+    if (99 == a_key) // 'c' == key
+    {
+        ApplyGrabCut();
+    }
+}
+
 void processVideo(char* videoFilename)
 {
     std::thread t(threadFn, std::ref(videoFilename));
     std::cout << "main thread\n";
 
-    size_t l_numFrames = 100;
+    size_t l_numFrames = 280;
 
     while (g_originalImages.size() < l_numFrames) {
         // cout << "waiting for 100 frames" << endl;
@@ -384,9 +681,10 @@ void processVideo(char* videoFilename)
     setMouseCallback(SUBTRACTED_WINDOW_NAME, MouseCallBackFunc, NULL);
 
     // show the current frame and the fg masks
-    imshow(ORIGINAL_WINDOW_NAME, g_originalImages.at(g_currentFrame));
-    imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
-    imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
+    g_currentFrame = l_numFrames;
+
+    g_grabCutIsInitialized = false;
+    ShowImages();
 
     while (g_currentFrame < g_originalImages.size())
     {
@@ -405,12 +703,11 @@ void processVideo(char* videoFilename)
             // putText(frame, frameNumberString.c_str(), cv::Point(15, 15),
             //         FONT_HERSHEY_SIMPLEX, 0.5 , cv::Scalar(0,0,0));
 
-            //show the current frame and the fg masks
-            imshow(ORIGINAL_WINDOW_NAME, g_originalImages.at(g_currentFrame));
-            imshow(SUBTRACTED_WINDOW_NAME, g_backgroundSubtractedImages.at(g_currentFrame));
-            imshow(MASK_WINDOW_NAME, g_imageMasks.at(g_currentFrame));
+            g_grabCutIsInitialized = false;
+            ShowImages();
         }
 
+        CheckForApplyGrabCut(l_key);
         UpdateDrawingMode(l_key);
         UpdateCircleRadius(l_key);
         MaybeSave(l_key);

@@ -44,3 +44,9 @@ target_link_libraries(tests ${LIBS})
 # tools
 add_executable(background_subtract tools/background_subtract/main.cpp)
 target_link_libraries(background_subtract ${LIBS})
+
+add_executable(export_frames tools/export_frames/main.cpp)
+target_link_libraries(export_frames ${LIBS})
+
+add_executable(grab_cut tools/grab_cut/main.cpp)
+target_link_libraries(grab_cut ${LIBS})
