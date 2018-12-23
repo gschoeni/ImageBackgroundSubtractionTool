@@ -5,6 +5,8 @@
 #include <opencv2/highgui.hpp>
 #include <opencv2/video.hpp>
 #include <opencv2/opencv.hpp>
+//boost
+#include <boost/lexical_cast.hpp>
 //C
 #include <stdio.h>
 #include <unistd.h>
@@ -24,7 +26,7 @@ size_t IMAGE_WIDTH = 342;
 size_t IMAGE_HEIGHT = 512;
 
 void help();
-void processVideo(const std::string& a_videoFilename, const std::string& a_outputDir);
+void processVideo(const std::string& a_videoFilename, const std::string& a_outputDir, bool a_shouldRotate);
 
 void help()
 {
@@ -38,19 +40,27 @@ int main(int argc, char* argv[])
     //print help information
     help();
     //check for the input parameter correctness
-    if(argc != 3) {
-        cerr <<"Incorret input list" << endl;
+    if(argc < 3) {
+        cerr <<"Incorrect input list" << endl;
         cerr <<"exiting..." << endl;
         return EXIT_FAILURE;
     }
+
+    bool shouldRotate = false;
+
+    if (argc == 4)
+    {
+        shouldRotate = boost::lexical_cast<bool>(argv[3]);
+        cout << "Should rotate? " << shouldRotate << endl;
+    }
     
-    processVideo(argv[1], argv[2]);
+    processVideo(argv[1], argv[2], shouldRotate);
 
     return EXIT_SUCCESS;
 }
 
 void processVideo(
-    const std::string& a_videoFilename, const std::string& a_outputDir)
+    const std::string& a_videoFilename, const std::string& a_outputDir, bool a_shouldRotate)
 {
     //create the capture object
     VideoCapture capture(a_videoFilename);
@@ -74,7 +84,10 @@ void processVideo(
         }
 
         cv::resize(frame, frame, cv::Size(IMAGE_HEIGHT, IMAGE_WIDTH));
-        cv::rotate(frame, frame, cv::ROTATE_90_CLOCKWISE);
+        if (a_shouldRotate)
+        {
+            cv::rotate(frame, frame, cv::ROTATE_90_CLOCKWISE);
+        }
 
         stringstream l_ss;
         l_ss << a_outputDir << "original_" << l_frameNum << ".png";
